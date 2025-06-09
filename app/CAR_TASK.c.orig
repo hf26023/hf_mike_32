@@ -1,0 +1,296 @@
+#include "CAR_TASK.h"
+#include "tim.h"
+#include "mpu6050.h"
+#include "echo.h"
+#include "stdio.h"
+#include "inv_mpu.h"
+#include "contrl.h"
+#include "delay.h"
+#include "my_usart.h"
+#include "oled.h"
+#include "adc.h"
+#define RXBUFFER_LEN 20
+
+struct mpu6050_data outMpu;
+int Velocity_Pwm,Turn_Pwm;//直立环、速度环计算的pwm
+int Motor1=0,Motor2=0,Motor3=0,Motor4=0;//左右电机最终输出的pwm
+float  Movement = 0;//目标速度
+float taget_yaw = 0;//目标角度
+int Contrl_Turn = 64;//
+int hf_Mode = 1;//小车工作模式 0 遥控模式；1 避障模式；2 巡线模式；
+int s1=1620,s2=1820,s3=1800,s4 = 1050;
+float alpha,beta,gama=0,x=60,y=140;
+int rx_cnt = 0;//失控标记
+int rxloss_flag = 1,avoidance_flag = 0,off_flag =0;
+int ex_dis = 15;
+float distrack_Kp = 3.5;
+
+//环境数据采集任务
+void Car_Task_200HZ(void)
+{
+    //static struct mpu6050_data Last_Data;
+    mpu_dmp_get_data(&outMpu.pitch,&outMpu.roll,&outMpu.yaw);
+    HAL_GPIO_TogglePin(GPIOA,GPIO_PIN_15);
+
+}
+
+
+/**************************************************************************************************************
+*函数名:Car_Task_100HZ(void)
+*功能；100hz任务
+*形参:无
+*返回值:无
+*确定直立环、速度环、转向环以及设置电机pwm
+**************************************************************************************************************/
+void Car_Task_100HZ(void)
+{
+    taget_yaw -= BT_Data.rudder*0.015;
+    if(taget_yaw >180) taget_yaw -= 360;
+    if(taget_yaw <-180) taget_yaw +=360;
+    Turn_Pwm = Vertical_turn_PD(taget_yaw,outMpu.yaw,outMpu.gyro_z);
+		//麦轮小车模式切换
+    switch(BT_Data.m4mode) {
+    case 0://无yaw角度闭环
+        Turn_Pwm = 2*BT_Data.rudder;
+		break;
+    case 1://有角度闭环，有避障
+        if(dis<150 && BT_Data.elevator>0) {
+            BT_Data.elevator=0;
+            avoidance_flag = 1;
+        }
+        else if(dis<100)  {
+            BT_Data.elevator = -(100-dis)*1.7;
+            avoidance_flag = 1;
+        }
+        else avoidance_flag = 0;
+				break;
+				
+		case 2://有角度闭环，无避障
+			break;
+		case 3://定距跟随
+			if(dis>300){
+				BT_Data.elevator=0;
+			}
+			else{
+				BT_Data.elevator = (dis - ex_dis)*distrack_Kp;
+			}
+			break;
+		default:
+			break;
+		
+    }
+
+
+
+    Motor4 = -BT_Data.aileron*30+BT_Data.elevator*20-Turn_Pwm;
+    Motor1 = BT_Data.aileron*30+BT_Data.elevator*20+Turn_Pwm;
+    Motor2 = -BT_Data.aileron*30+BT_Data.elevator*20+Turn_Pwm;
+    Motor3 = BT_Data.aileron*30+BT_Data.elevator*20-Turn_Pwm;
+    PWM_Limiting(&Motor1,&Motor2,&Motor3,&Motor4);//pwm限幅
+
+    if( HAL_GPIO_ReadPin(GPIOA,GPIO_PIN_5)) off_flag = 1;
+    else off_flag = 0;//离地检测
+
+
+    //失控或者离地保护，关闭电机
+    if (rxloss_flag == 0 && off_flag == 0) {
+        Set_PWM(Motor1,Motor2,Motor3,Motor4);
+    }
+    else {
+        Set_PWM(0,0,0,0);
+    }
+
+    x+= (float)BT_Data.x*25/2560;
+    y+= (float)BT_Data.y*25/2560;
+    gama = (float)BT_Data.z*90/127;
+
+    //机械臂运动范围限制
+    if(y<-90) {
+        y=-90;
+        if(x<95) x=95;
+        if(x>110) x=110;
+    }
+    else if(y<-30) {
+        if(x<95) x=95;
+        if(x>110) x=110;
+    }
+    else if(y<100) {
+        if(x<95) x=95;
+        if(x>140) x=140;
+    }
+    else if (y<140) {
+        if(x<60) x=60;
+        if(x>100) x =100;
+    }
+    else {
+        y=140;
+        if(x<60) x=60;
+        if(x>100) x =100;
+    }
+    //机械臂控制
+    arm_calculating( x,y,&alpha,&beta,&gama);//1620 1850 1800
+    s1=1620-(90-alpha)*2000/180;//最左侧值为机械臂竖直向上时对应的脉宽值，单位us
+    s2=1850-(alpha-beta)*2000/180;//最左侧值为机械臂竖直向上时对应的脉宽值，单位us
+    s3=1820+(-beta+gama)*2000/180;//最左侧值为机械臂竖直向上时对应的脉宽值，单位us
+    s4 = BT_Data.claw*(350)/256+1050;//最右侧值为夹爪关闭时对应的脉宽值，单位us
+    Set_Servo(s1,s2,s3,s4);
+
+}
+
+
+
+/**************************************************************************************************************
+*函数名:Car_Task_5HZ(void)
+*功能；10hz任务
+*形参:无
+*返回值:无
+*确定直立环、速度环、转向环以及设置电机pwm
+**************************************************************************************************************/
+int cnt =0;
+float bat_value;
+void Car_Task_10HZ(void)
+{
+    Getdistance();//超声波数据更新
+    //陀螺仪数据回传
+    printf("acc_x = %d\n",outMpu.acc_x);
+    printf("acc_y = %d\n",outMpu.acc_y);
+    printf("acc_z = %d\n",outMpu.acc_z);
+    printf("gyro_x = %d\n",outMpu.gyro_x);
+    printf("gyro_y = %d\n",outMpu.gyro_y);
+    printf("gyro_z = %d\n",outMpu.gyro_z);
+    printf("pitch = %f\n",outMpu.pitch);
+    printf("roll = %f\n",outMpu.roll);
+    printf("yaw = %f\n",outMpu.yaw);
+    printf("\r\n");
+    printf("dis = %f\n",dis);
+    //led闪烁（对应两个mos管）
+    switch(cnt) {
+    case 0:
+        HAL_GPIO_TogglePin(GPIOB,GPIO_PIN_3);
+        cnt++;
+        break;
+    case 1:
+        HAL_GPIO_TogglePin(GPIOB,GPIO_PIN_3);
+        HAL_GPIO_TogglePin(GPIOB,GPIO_PIN_4);
+        cnt++;
+        break;
+    case 2:
+        HAL_GPIO_TogglePin(GPIOB,GPIO_PIN_4);
+        HAL_GPIO_TogglePin(GPIOB,GPIO_PIN_5);
+        cnt++;
+        break;
+    case 3:
+        HAL_GPIO_TogglePin(GPIOB,GPIO_PIN_5);
+        HAL_GPIO_TogglePin(GPIOB,GPIO_PIN_3);
+        cnt=1;
+        break;
+    }
+    HAL_GPIO_TogglePin(GPIOC,GPIO_PIN_14);
+    HAL_GPIO_TogglePin(GPIOC,GPIO_PIN_13);
+
+
+    HAL_ADC_Start(&hadc1);
+    if(HAL_OK == HAL_ADC_PollForConversion(&hadc1,100))
+        bat_value =(float)HAL_ADC_GetValue(&hadc1)*0.005076;//4096*3.3*6*1.05
+}
+
+
+void Car_Task_Interaction_begin(void) {
+    //显示界面初始化
+    OLED_CLS();
+    OLED_ShowStr (1,1,"pitch:",1);
+    OLED_ShowStr (1,2,"roll:",1);
+    OLED_ShowStr (1,3,"yaw:",1);
+    OLED_ShowStr (1,4,"dis:",1);
+    OLED_ShowStr (1,5,"bat:",1);
+
+}
+
+void Car_Task_Interaction(void)
+{
+    //失控判断
+    if(BT_Data.mode == 0) {
+        rx_cnt ++;
+    }
+    else {
+        rx_cnt =0;
+        BT_Data.mode =0;
+    }
+
+    if (rx_cnt >3) {
+        if(rxloss_flag ==0) {
+
+            OLED_ShowStr(40,6,"rxloss",2);
+            rxloss_flag = 1;
+        }
+    }
+    else {
+        if(rxloss_flag ==1) {
+            rxloss_flag = 0;
+            OLED_ShowStr(40,6,"      ",2);
+        }
+    }
+
+    //离地显示
+    if(off_flag == 1) {
+        OLED_ShowStr(90,7,"off",1);
+    }
+    else {
+        OLED_ShowStr(90,7,"   ",1);
+    }
+    //欧拉角显示
+    if(outMpu.pitch<0)
+    {
+        OLED_ShowChar(46,1,'-',2);
+        OLED_ShowFloat(50,1,-outMpu.pitch,3,2);
+    }
+    else
+    {
+        OLED_ShowChar(46,1,' ',2);
+        OLED_ShowFloat(50,1,outMpu.pitch,3,2);
+    }
+
+    if(outMpu.roll<0)
+    {
+        OLED_ShowChar(46,2,'-',2);
+        OLED_ShowFloat(50,2,-outMpu.roll,3,2);
+    }
+    else
+    {
+        OLED_ShowChar(46,2,' ',2);
+        OLED_ShowFloat(50,2,outMpu.roll,3,2);
+    }
+
+    if(outMpu.yaw<0)
+    {
+        OLED_ShowChar(46,3,'-',2);
+        OLED_ShowFloat(50,3,-outMpu.yaw,3,2);
+    }
+    else
+    {
+        OLED_ShowChar(46,3,' ',2);
+        OLED_ShowFloat(50,3,outMpu.yaw,3,2);
+    }
+
+    OLED_ShowChar(46,4,' ',2);
+    //超声波检测距离显示
+    OLED_ShowNum(56,4,dis,4,2);
+    OLED_ShowStr(80,4,"mm",1);
+
+    //电池电压显示
+    OLED_ShowFloat(30,5,bat_value,4,2);
+    if(bat_value<7.8) {
+        OLED_ShowStr(90,5,"lowbat",1);
+        HAL_GPIO_WritePin(GPIOA,GPIO_PIN_15,GPIO_PIN_RESET);
+    }
+    else {
+        OLED_ShowStr(90,5,"      ",1);
+        HAL_GPIO_WritePin(GPIOA,GPIO_PIN_15,GPIO_PIN_SET);
+    }
+
+    //避障显示
+    if (avoidance_flag == 1) OLED_ShowStr(95,4,"!!",1);
+    else OLED_ShowStr(95,4,"  ",1);
+
+
+}
